@@ -19,7 +19,6 @@ pub struct Config {
     /// Added to PATH so Bots can run `botctl`.
     pub bin_dir: PathBuf,
     pub api_url: String,
-    pub bot_token: String,
     pub run_timeout: Duration,
     pub default_harness: String,
 }
@@ -45,6 +44,8 @@ pub struct App {
     /// Each Bot's screen. None when this server has no display tools.
     pub screens: Option<Screens>,
     bots: Mutex<HashMap<String, BotState>>,
+    /// Per-Bot bearer tokens (token -> bot_id) so a Bot can only act as itself.
+    bot_tokens: Mutex<HashMap<String, String>>,
     /// Bots waiting on `botctl ask` or `botctl handoff`, by the message's id.
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
     closing: AtomicBool,
@@ -52,7 +53,39 @@ pub struct App {
 
 impl App {
     pub fn new(db: Db, cfg: Config, screens: Option<Screens>) -> Arc<App> {
-        Arc::new(App { db, cfg, tx: broadcast::channel(1024).0, screens, bots: Mutex::default(), waiters: Mutex::default(), closing: AtomicBool::new(false) })
+        Arc::new(App {
+            db,
+            cfg,
+            tx: broadcast::channel(1024).0,
+            screens,
+            bots: Mutex::default(),
+            bot_tokens: Mutex::default(),
+            waiters: Mutex::default(),
+            closing: AtomicBool::new(false),
+        })
+    }
+
+    pub fn token_for(&self, bot_id: &str) -> String {
+        let mut map = self.bot_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((tok, _)) = map.iter().find(|(_, id)| *id == bot_id) {
+            return tok.clone();
+        }
+        let tok: String = crate::random_bytes(24).iter().map(|x| format!("{x:02x}")).collect();
+        map.insert(tok.clone(), bot_id.to_string());
+        tok
+    }
+
+    pub fn bot_for_token(&self, token: &str) -> Option<String> {
+        let map = self.bot_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter().find(|(t, _)| crate::same(t.as_bytes(), token.as_bytes())).map(|(_, id)| id.clone())
+    }
+
+    pub fn revoke_token(&self, bot_id: &str) {
+        self.bot_tokens.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, id| id != bot_id);
+    }
+
+    pub fn queue_len(&self, bot_id: &str) -> usize {
+        self.state().get(bot_id).map_or(0, |s| s.queue.len())
     }
 
     pub fn is_running(&self, bot_id: &str) -> bool {
@@ -188,7 +221,7 @@ impl App {
             let mut env = HashMap::from([
                 ("BOT_ID".to_string(), bot.id.clone()),
                 ("BOT_API".to_string(), self.cfg.api_url.clone()),
-                ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),
+                ("BOT_TOKEN".to_string(), self.token_for(&bot.id)),
             ]);
             let path = std::env::var("PATH").unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));

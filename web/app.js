@@ -58,8 +58,8 @@ function md(src) {
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
   return s.split(/\n{2,}/).map((para) => {
     const lines = para.split("\n");
     if (/^\u0000\d+\u0000$/.test(para.trim())) return para.trim();
@@ -401,7 +401,7 @@ $("composer").addEventListener("submit", (e) => {
 
 // New Bot window
 const COLORS = ["#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6", "#8b5cf6", "#e64a9c", "#7a7a7a"];
-const HARNESS_NAMES = { claude: "Claude Code", codex: "Codex", pi: "Pi" };
+const HARNESS_NAMES = { minimax: "MiniMax", claude: "Claude Code", codex: "Codex", pi: "Pi" };
 const nb = { color: COLORS[0], shape: "waddle", harness: "claude" };
 const pickOne = (a) => a[Math.floor(Math.random() * a.length)];
 

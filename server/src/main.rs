@@ -8,12 +8,12 @@ mod runner;
 mod screen;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use db::{BotPatch, Db};
 use runner::{App, Config};
 use serde_json::{json, Value};
@@ -56,9 +56,14 @@ async fn main() {
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");
     let password = env("AUTH_PASSWORD", "");
-    let default_harness = env("DEFAULT_HARNESS", "claude");
-    if password.is_empty() && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
-        eprintln!("Refusing to listen on a public address without AUTH_PASSWORD.");
+    let loopback = ["127.0.0.1", "localhost", "::1"].contains(&host.as_str());
+    let allow_no_auth = loopback && env("ALLOW_NO_AUTH", "") == "1";
+    let default_harness = env(
+        "DEFAULT_HARNESS",
+        if env("MINIMAX_API_KEY", "").is_empty() { "claude" } else { "minimax" },
+    );
+    if password.is_empty() && !allow_no_auth {
+        eprintln!("Refusing to start without AUTH_PASSWORD. Set AUTH_PASSWORD in .env (or ALLOW_NO_AUTH=1 on loopback for local dev).");
         std::process::exit(1);
     }
     if adapters::get(&default_harness).is_none() {
@@ -83,7 +88,6 @@ async fn main() {
         // `botctl` ships next to `botd`.
         bin_dir: std::env::current_exe().unwrap().parent().unwrap().to_path_buf(),
         api_url: format!("http://127.0.0.1:{port}"),
-        bot_token: random_bytes(24).iter().map(|x| format!("{x:02x}")).collect(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
     }, screens);
@@ -166,32 +170,90 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
+fn forbidden(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, msg.into())
+}
+
 fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
 }
 
 type Res<T = Json<Value>> = Result<T, ApiError>;
 
-// Auth: browser login with AUTH_PASSWORD (any username), or the Bots' token for `botctl`.
+#[derive(Clone)]
+enum AuthActor {
+    User,
+    Bot(String),
+}
 
-async fn auth(State(app): State<AppState>, req: Request, next: Next) -> Response {
+// Auth: browser login with AUTH_PASSWORD (any username), or a Bot's scoped token for `botctl`.
+
+async fn auth(State(app): State<AppState>, mut req: Request, next: Next) -> Response {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
     let password = PASSWORD.get().unwrap();
-    let ok = password.is_empty()
-        || h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), app.cfg.bot_token.as_bytes()))
+
+    let actor = if let Some(tok) = h.strip_prefix("Bearer ") {
+        let Some(bot_id) = app.bot_for_token(tok) else {
+            return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response();
+        };
+        if !is_bot_route(req.method(), req.uri().path(), &bot_id) {
+            return forbidden("Bot token is not permitted for this route").into_response();
+        }
+        AuthActor::Bot(bot_id)
+    } else if password.is_empty()
         || h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
             let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
             same(pass, password.as_bytes())
-        });
-    if ok {
-        next.run(req).await
+        })
+    {
+        if !same_origin(req.headers(), req.method()) {
+            return forbidden("Cross-origin request blocked").into_response();
+        }
+        AuthActor::User
     } else {
-        (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response()
+        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response();
+    };
+
+    req.extensions_mut().insert(actor);
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
+    res
+}
+
+fn is_bot_route(method: &Method, path: &str, bot_id: &str) -> bool {
+    (*method == Method::GET && path == "/api/bots")
+        || (*method == Method::POST && (path == "/api/ask" || path == "/api/handoff"))
+        || ((*method == Method::GET || *method == Method::POST) && path == format!("/api/bots/{bot_id}/routines"))
+        || ((*method == Method::PATCH || *method == Method::DELETE) && path.starts_with("/api/routines/"))
+}
+
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    Some(rest.split('/').next().unwrap_or(rest))
+}
+
+fn same_origin(headers: &HeaderMap, method: &Method) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
     }
+    let expected = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim());
+    let check = |val: Option<&header::HeaderValue>| -> bool {
+        let Some(val) = val else { return true };
+        let Some(s) = val.to_str().ok() else { return false };
+        matches!((host_of(s), expected), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
+    };
+    check(headers.get(header::ORIGIN)) && check(headers.get(header::REFERER))
 }
 
 /// Constant-time comparison.
-fn same(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -345,6 +407,7 @@ async fn delete_bot(State(app): State<AppState>, Path(id): Path<String>) -> Res 
         return Err(bad("The primary Bot can't be deleted"));
     }
     app.stop(&id);
+    app.revoke_token(&id);
     if let Some(screens) = &app.screens {
         screens.remove(&id).await;
     }
@@ -391,6 +454,9 @@ async fn send_message(State(app): State<AppState>, Path(id): Path<String>, Json(
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
     }
+    if app.queue_len(&id) >= 100 {
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "Too many queued messages for this Bot".into()));
+    }
     let msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
     app.push_message(&msg);
     app.enqueue(msg.clone());
@@ -399,8 +465,13 @@ async fn send_message(State(app): State<AppState>, Path(id): Path<String>, Json(
 
 // Bot to Bot: `botctl ask`. Waits for the reply and returns it as plain text.
 
-async fn ask(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String, ApiError> {
+async fn ask(State(app): State<AppState>, Extension(actor): Extension<AuthActor>, Json(v): Json<Value>) -> Result<String, ApiError> {
     let from = v["from"].as_str().and_then(|id| app.db.bot(id)).ok_or_else(|| bad("Unknown asking Bot (BOT_ID)"))?;
+    if let AuthActor::Bot(caller) = &actor
+        && caller != &from.id
+    {
+        return Err(forbidden("Bot token does not match asking Bot"));
+    }
     let to_key = v["to"].as_str().map(str::trim).unwrap_or("");
     let bots = app.db.bots();
     let to = bots
@@ -411,9 +482,13 @@ async fn ask(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String
     if to.id == from.id {
         return Err(bad("You can't ask yourself"));
     }
+    if app.queue_len(&to.id) >= 50 {
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, format!("{} has too many queued messages right now.", to.name)));
+    }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
+    let text: String = text.chars().take(100_000).collect();
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
-    Ok(match app.ask(&from, to, text, wait).await {
+    Ok(match app.ask(&from, to, &text, wait).await {
         Some(reply) => reply,
         None => format!("{} is still working on it. Their reply will arrive later as a new message.", to.name),
     })
@@ -433,8 +508,13 @@ async fn screen_info(State(app): State<AppState>, Path(id): Path<String>) -> Res
 
 // A Bot hands its screen to the user: `botctl handoff`. Waits for "Done".
 
-async fn handoff(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String, ApiError> {
+async fn handoff(State(app): State<AppState>, Extension(actor): Extension<AuthActor>, Json(v): Json<Value>) -> Result<String, ApiError> {
     let bot = v["from"].as_str().and_then(|id| app.db.bot(id)).ok_or_else(|| bad("Unknown Bot (BOT_ID)"))?;
+    if let AuthActor::Bot(caller) = &actor
+        && caller != &bot.id
+    {
+        return Err(forbidden("Bot token does not match Bot"));
+    }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Say what you need"))?;
     let text: String = text.chars().take(300).collect();
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
@@ -461,8 +541,13 @@ async fn create_routine(State(app): State<AppState>, Path(id): Path<String>, Jso
     Ok((StatusCode::CREATED, Json(json!(app.db.add_routine(&id, name, cron_expr, instruction)))))
 }
 
-async fn update_routine(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
-    app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+async fn update_routine(State(app): State<AppState>, Extension(actor): Extension<AuthActor>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let routine = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+    if let AuthActor::Bot(caller) = &actor
+        && caller != &routine.bot_id
+    {
+        return Err(forbidden("Routine belongs to another Bot"));
+    }
     let cron_expr = v["cron"].as_str();
     if let Some(c) = cron_expr {
         cron::parse(c).map_err(bad)?;
@@ -471,8 +556,47 @@ async fn update_routine(State(app): State<AppState>, Path(id): Path<String>, Jso
     Ok(Json(json!(app.db.routine(&id))))
 }
 
-async fn delete_routine(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+async fn delete_routine(State(app): State<AppState>, Extension(actor): Extension<AuthActor>, Path(id): Path<String>) -> Res {
+    let routine = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+    if let AuthActor::Bot(caller) = &actor
+        && caller != &routine.bot_id
+    {
+        return Err(forbidden("Routine belongs to another Bot"));
+    }
     app.db.delete_routine(&id);
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_routes_are_scoped() {
+        assert!(is_bot_route(&Method::GET, "/api/bots", "b1"));
+        assert!(is_bot_route(&Method::POST, "/api/ask", "b1"));
+        assert!(is_bot_route(&Method::POST, "/api/handoff", "b1"));
+        assert!(is_bot_route(&Method::GET, "/api/bots/b1/routines", "b1"));
+        assert!(is_bot_route(&Method::POST, "/api/bots/b1/routines", "b1"));
+        assert!(is_bot_route(&Method::PATCH, "/api/routines/r1", "b1"));
+        assert!(is_bot_route(&Method::DELETE, "/api/routines/r1", "b1"));
+
+        assert!(!is_bot_route(&Method::POST, "/api/bots", "b1"));
+        assert!(!is_bot_route(&Method::DELETE, "/api/bots/b1", "b1"));
+        assert!(!is_bot_route(&Method::POST, "/api/bots/b2/messages", "b1"));
+        assert!(!is_bot_route(&Method::GET, "/api/bots/b2/routines", "b1"));
+        assert!(!is_bot_route(&Method::GET, "/api/state", "b1"));
+    }
+
+    #[test]
+    fn origin_check_blocks_cross_origin_mutations() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_static("bots.example.com"));
+        h.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        assert!(!same_origin(&h, &Method::POST));
+        assert!(same_origin(&h, &Method::GET));
+
+        h.insert(header::ORIGIN, HeaderValue::from_static("https://bots.example.com"));
+        assert!(same_origin(&h, &Method::POST));
+    }
 }

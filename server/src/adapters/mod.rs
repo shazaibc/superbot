@@ -4,6 +4,7 @@
 
 mod claude;
 mod codex;
+mod minimax;
 mod pi;
 
 use serde_json::Value;
@@ -49,6 +50,14 @@ pub trait Adapter: Send {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>);
     /// Models this harness can run here, with their reasoning efforts. Blocking.
     fn models(&self) -> Vec<ModelOption>;
+    /// Harness-specific environment overrides for the child process.
+    fn env(&self, _input: &RunInput) -> HashMap<String, String> {
+        HashMap::new()
+    }
+    /// Environment variables to scrub from the child process before applying `env()`.
+    fn env_remove(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -91,10 +100,11 @@ pub fn output(bin: &str, args: &[&str]) -> String {
 }
 
 /// To add a harness: write one adapter file and list it here.
-pub const NAMES: [&str; 3] = ["claude", "codex", "pi"];
+pub const NAMES: [&str; 4] = ["minimax", "claude", "codex", "pi"];
 
 pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
+        "minimax" => Some(Box::new(minimax::MiniMax::default())),
         "claude" => Some(Box::new(claude::Claude::default())),
         "codex" => Some(Box::new(codex::Codex)),
         "pi" => Some(Box::new(pi::Pi)),
@@ -106,14 +116,7 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
 pub fn installed() -> Vec<&'static str> {
     NAMES
         .into_iter()
-        .filter(|n| {
-            let bin = get(n).unwrap().bin();
-            std::process::Command::new("sh")
-                .args(["-c", &format!("command -v {bin}")])
-                .stdout(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        })
+        .filter(|n| crate::screen::on_path(get(n).unwrap().bin()))
         .collect()
 }
 
@@ -129,19 +132,26 @@ pub async fn run(
 ) {
     let mut out = Vec::new();
     let args = adapter.args(&input, &mut out);
+    let adapter_env = adapter.env(&input);
+    let adapter_env_remove = adapter.env_remove();
     out.drain(..).for_each(&mut emit);
 
-    let mut child = match Command::new(adapter.bin())
-        .args(&args)
+    let mut cmd = Command::new(adapter.bin());
+    cmd.args(&args)
         .current_dir(&input.cwd)
-        .envs(&input.env)
+        .env_remove("AUTH_PASSWORD");
+    for k in adapter_env_remove {
+        cmd.env_remove(k);
+    }
+    cmd.envs(&input.env)
+        .envs(&adapter_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0) // own group, so stop kills the whole tree
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return emit(AgentEvent::Error(format!("Couldn't start {}: {e}", adapter.bin()))),
     };

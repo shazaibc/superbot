@@ -22,11 +22,12 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 
 Each adapter is one file in `server/src/adapters/`. It builds the command line and maps the CLI's JSON lines to five events: session, text delta, text, tool, error.
 
+- **MiniMax**: uses `claude` CLI pointed at `https://api.minimax.io/anthropic` (`MINIMAX_API_KEY`, models `MiniMax-M3.1-Flash` and `MiniMax-M3`).
 - **Claude Code**: `claude -p --output-format stream-json --resume <id>`. System prompt via `--append-system-prompt`, fresh every run.
 - **Codex**: `codex exec --json`, then `codex exec resume <id>`. Instructions via `-c developer_instructions=...`. Codex only reads them when a session starts, so later memory edits reach it through the memory file.
 - **Pi**: `pi --mode json --session-dir <bot dir> --session-id <id>`. System prompt via `--append-system-prompt`.
 
-All three run with permission prompts off (`--dangerously-skip-permissions` and equivalents). The server is the computer, so treat it that way. Approvals are not built yet.
+All four run with permission prompts off (`--dangerously-skip-permissions` and equivalents). The server is the computer, so treat it that way. Approvals are not built yet.
 
 Add a harness: write one adapter file and add it to `get()` and `NAMES` in `adapters/mod.rs`.
 
@@ -34,7 +35,7 @@ Add a harness: write one adapter file and add it to `get()` and `NAMES` in `adap
 
 ```sh
 cargo build --release          # makes target/release/botd and target/release/botctl
-cp .env.example .env           # fill it in
+cp .env.example .env           # fill in AUTH_PASSWORD and API key
 set -a; . ./.env; set +a
 ./target/release/botd
 ```
@@ -44,11 +45,11 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 ## Deploying on a Linux VPS
 
 - Keep your server IP, domain, and secrets out of this repo. They go in `.env` on the server.
-
-- Install the harness CLIs you want and log them in **as the user that runs `botd`**: `claude` (then `claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`). Their env vars pass through to the Bots.
+- On Ubuntu 24.04+, `sudo deploy/setup-vps.sh` creates a dedicated `superbot` user, installs Node.js + `@anthropic-ai/claude-code` (for `minimax`/`claude`), Rust, Caddy, Bot screens, and `systemd` service templates ([Caddyfile.example](../deploy/Caddyfile.example), [botd.service.example](../deploy/botd.service.example)).
+- Or install the harness CLIs manually **as the user that runs `botd`**: `minimax` (`claude` CLI + `MINIMAX_API_KEY`), `claude` (`claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`). `AUTH_PASSWORD` is scrubbed from Bot child processes, and each Bot gets a scoped token limited to `botctl` routes.
 - Run `botd` as a normal user, not root. Claude Code refuses to skip permissions as root.
 - Run it under systemd with `Restart=always`. It shuts down cleanly on SIGTERM.
-- Put HTTPS in front (e.g. Caddy) and set `AUTH_PASSWORD` and `HOST=0.0.0.0`, or keep `HOST=127.0.0.1` behind the proxy. The browser logs in with any username and that password.
+- Put HTTPS in front (e.g. Caddy) and always set `AUTH_PASSWORD` (required unless `ALLOW_NO_AUTH=1` on loopback). The browser logs in with any username and that password.
 - Proxies must not buffer `/api/events` (it's an SSE stream).
 - Set `TZ` to the user's time zone. Routines use it.
 - Back up `DATA_DIR`. `WORKSPACE_DIR` is the Bots' scratch and files.

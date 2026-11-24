@@ -6,7 +6,9 @@
 set -eu
 BOT_USER=${1:?usage: install-computer.sh <user that runs botd>}
 AB_VERSION=v0.43.0  # agent-browser
+AB_SHA256=8e69c9fb662514c9cf36e4911e94e913742ba066e55102486350e049dd847612
 AD_VERSION=v1.3.1   # agent-desktop
+AD_SHA256=ca77b6b75034eeb12e537dd8c0a4f2a3424119253f38b7e6bd79ba0d2fef1264
 VOXL_VERSION=0.3.5
 SHARE=/opt/computer/share
 export DEBIAN_FRONTEND=noninteractive
@@ -17,8 +19,9 @@ apt-get install -y -qq xvfb openbox x11-utils dbus-x11 at-spi2-core fonts-noto-c
   git curl build-essential pkg-config clang libx264-dev libyuv-dev libopus-dev esbuild earlyoom >/dev/null
 
 echo "== agent-browser $AB_VERSION"
-# Download, then rename into place: works while a browser daemon is running the old binary.
+# Download, verify SHA-256, then rename into place: works while a browser daemon is running the old binary.
 curl -fsSL -o /usr/local/bin/.agent-browser.new "https://github.com/vercel-labs/agent-browser/releases/download/$AB_VERSION/agent-browser-linux-x64"
+echo "$AB_SHA256  /usr/local/bin/.agent-browser.new" | sha256sum -c -
 chmod 755 /usr/local/bin/.agent-browser.new && mv -f /usr/local/bin/.agent-browser.new /usr/local/bin/agent-browser
 agent-browser install --with-deps >/dev/null   # Chrome's system libraries
 su - "$BOT_USER" -c "agent-browser install" >/dev/null  # Chrome for Testing, for the Bot user
@@ -29,11 +32,11 @@ git -c advice.detachedHead=false clone -q --depth 1 --branch "$AB_VERSION" --fil
 git -C /tmp/ab-src sparse-checkout set skill-data
 cp -r /tmp/ab-src/skill-data "$SHARE/agent-browser-skills" && rm -rf /tmp/ab-src
 
-# Ubuntu 23.10+ blocks Chrome's sandbox for unprivileged users. Allow it for this Chrome only.
-cat > /etc/apparmor.d/agent-browser-chrome <<'AA'
+# Ubuntu 23.10+ blocks Chrome's sandbox for unprivileged users. Allow it for this Bot user's Chrome only.
+cat > /etc/apparmor.d/agent-browser-chrome <<AA
 abi <abi/4.0>,
 include <tunables/global>
-profile agent-browser-chrome /home/*/.agent-browser/browsers/*/chrome flags=(unconfined) {
+profile agent-browser-chrome /home/$BOT_USER/.agent-browser/browsers/*/chrome flags=(unconfined) {
   userns,
   include if exists <local/agent-browser-chrome>
 }
@@ -41,7 +44,9 @@ AA
 apparmor_parser -r /etc/apparmor.d/agent-browser-chrome
 
 echo "== agent-desktop $AD_VERSION"
-mkdir -p /tmp/ad && curl -fsSL "https://github.com/vercel-labs/agent-desktop/releases/download/$AD_VERSION/agent-desktop-$AD_VERSION-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /tmp/ad
+mkdir -p /tmp/ad && curl -fsSL -o /tmp/ad/ad.tar.gz "https://github.com/vercel-labs/agent-desktop/releases/download/$AD_VERSION/agent-desktop-$AD_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+echo "$AD_SHA256  /tmp/ad/ad.tar.gz" | sha256sum -c -
+tar -xzf /tmp/ad/ad.tar.gz -C /tmp/ad
 mv -f /tmp/ad/agent-desktop /tmp/ad/agent-desktop-linux-clipboard-owner /usr/local/bin/ && rm -rf /tmp/ad
 
 echo "== voxl $VOXL_VERSION (builds from source, a few minutes)"

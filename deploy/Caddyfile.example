@@ -1,0 +1,19 @@
+<your-domain> {
+	@screen path_regexp screen ^/screen/(69[0-9][0-9])/
+	handle @screen {
+		uri strip_prefix /screen/{re.screen.1}
+		reverse_proxy 127.0.0.1:{re.screen.1} {
+			header_up Host localhost
+		}
+	}
+
+	handle /api/events {
+		reverse_proxy 127.0.0.1:3000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}

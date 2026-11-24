@@ -16,52 +16,13 @@ impl Adapter for Claude {
     }
 
     fn args(&mut self, input: &RunInput, _out: &mut Vec<AgentEvent>) -> Vec<String> {
-        self.id = input.session_id.clone().unwrap_or_else(new_uuid);
-        let mut a: Vec<String> = [
-            "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-            "--dangerously-skip-permissions", "--append-system-prompt", &input.system,
-        ]
-        .map(String::from)
-        .into();
-        a.extend([if input.session_id.is_some() { "--resume" } else { "--session-id" }.into(), self.id.clone()]);
-        if let Some(m) = &input.model {
-            a.extend(["--model".into(), m.clone()]);
-        }
-        if let Some(e) = &input.effort {
-            a.extend(["--effort".into(), e.clone()]);
-        }
-        a.extend(["--".into(), input.prompt.clone()]);
-        a
+        let (id, args) = build_args(input, None);
+        self.id = id;
+        args
     }
 
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>) {
-        match str_of(e, "type") {
-            "stream_event" => {
-                let ev = &e["event"];
-                if str_of(ev, "type") == "content_block_delta" && str_of(&ev["delta"], "type") == "text_delta" {
-                    out.push(AgentEvent::TextDelta(str_of(&ev["delta"], "text").into()));
-                }
-            }
-            "assistant" => {
-                // Save the session only once it really exists.
-                if !self.saw_turn {
-                    self.saw_turn = true;
-                    out.push(AgentEvent::Session(self.id.clone()));
-                }
-                for c in e["message"]["content"].as_array().into_iter().flatten() {
-                    match str_of(c, "type") {
-                        "text" if !str_of(c, "text").trim().is_empty() => out.push(AgentEvent::Text(str_of(c, "text").into())),
-                        "tool_use" => out.push(AgentEvent::Tool { name: str_of(c, "name").into(), detail: describe(&c["input"]) }),
-                        _ => {}
-                    }
-                }
-            }
-            "result" if e["is_error"].as_bool() == Some(true) => {
-                let msg = e["result"].as_str().unwrap_or("Claude Code failed");
-                out.push(AgentEvent::Error(msg.into()));
-            }
-            _ => {}
-        }
+        handle_event(&self.id, &mut self.saw_turn, e, out);
     }
 
     /// Claude Code has no command to list models, so this is the current lineup.
@@ -76,5 +37,54 @@ impl Adapter for Claude {
         ]
         .map(|(id, label, alias)| ModelOption { id: id.into(), label: label.into(), efforts: efforts.clone(), aliases: vec![alias.into()] })
         .into()
+    }
+}
+
+pub(super) fn build_args(input: &RunInput, default_model: Option<&str>) -> (String, Vec<String>) {
+    let id = input.session_id.clone().unwrap_or_else(new_uuid);
+    let mut a: Vec<String> = [
+        "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+        "--dangerously-skip-permissions", "--append-system-prompt", &input.system,
+    ]
+    .map(String::from)
+    .into();
+    a.extend([if input.session_id.is_some() { "--resume" } else { "--session-id" }.into(), id.clone()]);
+    if let Some(m) = input.model.as_deref().or(default_model) {
+        a.extend(["--model".into(), m.into()]);
+    }
+    if let Some(e) = &input.effort {
+        a.extend(["--effort".into(), e.clone()]);
+    }
+    a.extend(["--".into(), input.prompt.clone()]);
+    (id, a)
+}
+
+pub(super) fn handle_event(id: &str, saw_turn: &mut bool, e: &Value, out: &mut Vec<AgentEvent>) {
+    match str_of(e, "type") {
+        "stream_event" => {
+            let ev = &e["event"];
+            if str_of(ev, "type") == "content_block_delta" && str_of(&ev["delta"], "type") == "text_delta" {
+                out.push(AgentEvent::TextDelta(str_of(&ev["delta"], "text").into()));
+            }
+        }
+        "assistant" => {
+            // Save the session only once it really exists.
+            if !*saw_turn {
+                *saw_turn = true;
+                out.push(AgentEvent::Session(id.to_string()));
+            }
+            for c in e["message"]["content"].as_array().into_iter().flatten() {
+                match str_of(c, "type") {
+                    "text" if !str_of(c, "text").trim().is_empty() => out.push(AgentEvent::Text(str_of(c, "text").into())),
+                    "tool_use" => out.push(AgentEvent::Tool { name: str_of(c, "name").into(), detail: describe(&c["input"]) }),
+                    _ => {}
+                }
+            }
+        }
+        "result" if e["is_error"].as_bool() == Some(true) => {
+            let msg = e["result"].as_str().unwrap_or("Claude Code failed");
+            out.push(AgentEvent::Error(msg.into()));
+        }
+        _ => {}
     }
 }

@@ -112,10 +112,15 @@ impl Screens {
         let Info { display, bus, port, .. } = self.info(&s);
         let n = self.base + slot;
 
-        // Leftovers from a crash would stop Xvfb from starting.
+        // Leftovers from a crash would stop Xvfb from starting. Only unlink non-symlinks.
+        let remove_if_not_symlink = |p: &Path| {
+            if std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink()) {
+                let _ = std::fs::remove_file(p);
+            }
+        };
         let sock = PathBuf::from(format!("/tmp/.X11-unix/X{n}"));
-        let _ = std::fs::remove_file(format!("/tmp/.X{n}-lock"));
-        let _ = std::fs::remove_file(&sock);
+        remove_if_not_symlink(&PathBuf::from(format!("/tmp/.X{n}-lock")));
+        remove_if_not_symlink(&sock);
         s.procs.push(spawn(Command::new("Xvfb").args([&display, "-screen", "0", &format!("{}x24", self.size), "-nolisten", "tcp"]))?);
         for _ in 0..50 {
             if sock.exists() {
@@ -132,10 +137,11 @@ impl Screens {
         s.procs.push(spawn(Command::new("dbus-daemon").args(["--session", "--nofork", &format!("--address={bus}")]))?);
         s.procs.push(spawn(Command::new("openbox").env("DISPLAY", &display).env("DBUS_SESSION_BUS_ADDRESS", &bus))?);
         if on_path("voxl") {
+            let allowed_hosts = crate::env("SCREEN_ALLOWED_HOSTS", "127.0.0.1,localhost");
             // voxl's own token login guards the stream; the proxy in front adds HTTPS.
             s.procs.push(spawn(
                 Command::new("voxl")
-                    .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
+                    .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", &allowed_hosts])
                     .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
                     .env("DISPLAY", &display)
                     .env("VOXL_PASSWORD", &s.token),
